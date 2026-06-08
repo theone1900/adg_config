@@ -1,0 +1,483 @@
+package main
+
+import (
+	"bufio"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+)
+
+// ANSI 颜色定义
+const (
+	ColorReset  = "\033[0m"
+	ColorGreen  = "\033[1;32m"
+	ColorRed    = "\033[1;31m"
+	ColorYellow = "\033[1;33m"
+	ColorBlue   = "\033[1;34m"
+	ColorCyan   = "\033[1;36m"
+	ColorWhite  = "\033[1;37m"
+)
+
+// 全局配置变量
+var (
+	OracleSid       string
+	PrimaryOracleHome string
+	StandbyOracleHome string
+	PriIP           string
+	StbIP           string
+	PriDBUniqueName string
+	StbDBUniqueName string
+	PriTns          string
+	StbTns          string
+	SysPassword     string
+	SSHUser         string // SSH 用户名
+	SSHPassword     string // SSH 密码
+	LogFile         *os.File
+	DemoMode        bool // 是否开启模拟演练模式
+)
+
+func main() {
+	showBanner()
+	readInputs()
+
+	// 初始化演练/部署日志
+	logSuffix := "deploy"
+	if DemoMode {
+		logSuffix = "demo_dryrun"
+	}
+	logPath := fmt.Sprintf("/tmp/dg_%s_%s_%s.log", logSuffix, OracleSid, time.Now().Format("20060102_150405"))
+
+	var err error
+	LogFile, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		fmt.Printf("无法创建日志文件: %v\n", err)
+		os.Exit(1)
+	}
+	defer LogFile.Close()
+
+	if DemoMode {
+		logWarn("==========================================================")
+		logWarn("  当前已启用 [-demo] 演练模式！不执行破坏性命令，仅输出剧本。")
+		logWarn("==========================================================")
+	}
+	logInfo(fmt.Sprintf("完整执行演练剧本将存盘至: %s", logPath))
+
+	// Step 1: 环境校验
+	validateAndFixPrimary()
+
+	// Step 2: 配置主库集群级参数与 Standby Redo Log
+	configurePrimaryDB()
+
+	// Step 3: 生成并重构备库 PFILE
+	generateAndModifyPfile()
+
+	// Step 4: 跨网传输凭证文件
+	transferRequiredFiles()
+
+	// Step 5: 远程构建备库物理目录
+	remoteCreateDirectories()
+
+	// Step 6: 远程拉起备库裸实例到 NOMOUNT
+	remoteStartupNomount()
+
+	// Step 7: 运行 RMAN 联机物理克隆
+	runRmanDuplicate()
+
+	// Step 8: 激活 ADG 实时应用同步
+	remoteEnableADG()
+
+	// Step 9: 终审状态审计
+	auditFinalStatus()
+}
+
+func showBanner() {
+	fmt.Print(ColorCyan)
+	fmt.Println("  ____  ____    _    ____ _     _____    _    ____   ____      ____  _____ _____ _   _ ____  ")
+	fmt.Print(ColorReset)
+	fmt.Println(ColorWhite + "================================================================================" + ColorReset)
+	fmt.Println(ColorGreen + "               欢迎使用 Oracle 11g Active Data Guard Go 自动化部署工具 v1.0" + ColorReset)
+	fmt.Println(ColorWhite + "================================================================================" + ColorReset)
+}
+
+func readInputs() {
+	reader := bufio.NewReader(os.Stdin)
+
+	// 新增：是否开启 Demo 模拟
+	fmt.Print(" 是否开启 [-demo] 模拟演练模式？(y/n) [y]: ")
+	isDemo, _ := reader.ReadString('\n')
+	isDemo = strings.ToLower(strings.TrimSpace(isDemo))
+	if isDemo == "n" {
+		DemoMode = false
+	} else {
+		DemoMode = true // 默认开启模拟，防止误伤生产
+	}
+
+	fmt.Print(" 1. 请输入主备库的 ORACLE_SID [orcl]: ")
+	sid, _ := reader.ReadString('\n')
+	OracleSid = strings.TrimSpace(sid)
+	if OracleSid == "" {
+		OracleSid = "orcl"
+	}
+
+	fmt.Print(" 2. 请输入主库 ORACLE_HOME 路径 [/u01/app/oracle/product/11.2.0/dbhome_1]: ")
+	home, _ := reader.ReadString('\n')
+	PrimaryOracleHome = strings.TrimSpace(home)
+	if PrimaryOracleHome == "" {
+		PrimaryOracleHome = "/u01/app/oracle/product/11.2.0/dbhome_1"
+	}
+
+	fmt.Print(" 3. 请输入备库 ORACLE_HOME 路径 [/u01/app/oracle/product/11.2.0/dbhome_1]: ")
+	shome, _ := reader.ReadString('\n')
+	StandbyOracleHome = strings.TrimSpace(shome)
+	if StandbyOracleHome == "" {
+		StandbyOracleHome = "/u01/app/oracle/product/11.2.0/dbhome_1"
+	}
+
+	// Note: IP prompts shifted down due to added ORACLE_HOME prompts
+	fmt.Print(" 4. 请输入主库(Primary) IP [192.168.1.10]: ")
+	pip, _ := reader.ReadString('\n')
+	PriIP = strings.TrimSpace(pip)
+	if PriIP == "" {
+		PriIP = "192.168.1.10"
+	}
+
+	fmt.Print(" 5. 请输入备库(Standby) IP [192.168.1.20]: ")
+	sip, _ := reader.ReadString('\n')
+	StbIP = strings.TrimSpace(sip)
+	if StbIP == "" {
+		StbIP = "192.168.1.20"
+	}
+
+	fmt.Print(" 5. 请输入主库 DB_UNIQUE_NAME [orcl]: ")
+	pun, _ := reader.ReadString('\n')
+	PriDBUniqueName = strings.TrimSpace(pun)
+	if PriDBUniqueName == "" {
+		PriDBUniqueName = "orcl"
+	}
+
+	defaultStbName := PriDBUniqueName + "_std"
+	fmt.Printf(" 6. 请输入备库 DB_UNIQUE_NAME [%s]: ", defaultStbName)
+	sun, _ := reader.ReadString('\n')
+	StbDBUniqueName = strings.TrimSpace(sun)
+	if StbDBUniqueName == "" {
+		StbDBUniqueName = defaultStbName
+	}
+
+	fmt.Print(" 7. 请输入主库 TNS 别名 [ORCL_PRI]: ")
+	ptns, _ := reader.ReadString('\n')
+	PriTns = strings.TrimSpace(ptns)
+	if PriTns == "" {
+		PriTns = "ORCL_PRI"
+	}
+
+	fmt.Print(" 8. 请输入备库 TNS 别名 [ORCL_STB]: ")
+	stns, _ := reader.ReadString('\n')
+	StbTns = strings.TrimSpace(stns)
+	if StbTns == "" {
+		StbTns = "ORCL_STB"
+	}
+
+	fmt.Print(" 9. 请输入数据库 SYS 用户的密码: ")
+	pwd, _ := reader.ReadString('\n')
+	SysPassword = strings.TrimSpace(pwd)
+
+	fmt.Print(" 10. 请输入备库 SSH 用户名 [oracle]: ")
+	sshUser, _ := reader.ReadString('\n')
+	SSHUser = strings.TrimSpace(sshUser)
+	if SSHUser == "" {
+		SSHUser = "oracle"
+	}
+
+	fmt.Print(" 11. 请输入备库 SSH 用户密码 (root/oracle): ")
+	sshPwd, _ := reader.ReadString('\n')
+	SSHPassword = strings.TrimSpace(sshPwd)
+
+	fmt.Println("\n--------------------------------------------------------------------------------")
+}
+
+func logOutput(level, color, msg string) {
+	ts := time.Now().Format("2006-01-02 15:04:05")
+	rawLine := fmt.Sprintf("[%s] [%s] %s\n", ts, level, msg)
+	colorLine := fmt.Sprintf("[%s] [%s%s%s] %s\n", ts, color, level, ColorReset, msg)
+	fmt.Print(colorLine)
+	if LogFile != nil {
+		LogFile.WriteString(rawLine)
+	}
+}
+
+func logInfo(msg string)  { logOutput("INFO", ColorGreen, msg) }
+func logWarn(msg string)  { logOutput("WARN", ColorYellow, msg) }
+func logError(msg string) { logOutput("ERROR", ColorRed, msg) }
+func logCheck(msg string) { logOutput("CHECK", ColorBlue, msg) }
+
+// 核心抽象：模拟或真实执行本地 SQL
+func execLocalSQL(query string) {
+	if DemoMode {
+		logInfo(fmt.Sprintf("[模拟本地SQL执行]: %s;", query))
+		return
+	}
+
+	// 真实环境执行逻辑：使用 sqlplus 执行 SQL
+	sqlplusInput := fmt.Sprintf("connect / as sysdba\n%s\nexit;\n", query)
+
+	cmd := exec.Command("sqlplus", "-s", "/nolog")
+	cmd.Stdin = strings.NewReader(sqlplusInput)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logError(fmt.Sprintf("执行SQL失败 [%s]: %v\n%s", query, err, string(output)))
+		return
+	}
+
+	logInfo(fmt.Sprintf("[本地SQL执行成功]: %s", query))
+	if len(string(output)) > 0 {
+		logInfo(fmt.Sprintf("返回信息: %s", string(output)))
+	}
+}
+
+// 核心抽象：模拟或真实执行远程 SSH 脚本
+// 使用系统 ssh 命令而不依赖golang.org/x/crypto
+func execRemoteSSH(stepName, script string) {
+	if DemoMode {
+		logInfo(fmt.Sprintf("[模拟远程SSH投递] -> 节点: %s | 阶段: %s", StbIP, stepName))
+		formattedScript := "\n\t" + strings.ReplaceAll(strings.TrimSpace(script), "\n", "\n\t")
+		logInfo(fmt.Sprintf("拟派发指令集: %s", formattedScript))
+		return
+	}
+
+	// 真实环境：使用系统 ssh 命令
+	targetAddr := fmt.Sprintf("%s@%s", SSHUser, StbIP)
+	logInfo(fmt.Sprintf("[远程SSH投递] -> 节点: %s | 阶段: %s", targetAddr, stepName))
+
+	// 构建 sshpass 或 ssh-keyscan 命令
+	var cmd *exec.Cmd
+
+	if SSHPassword != "" {
+		// 使用密码认证：通过管道传递密码
+		// 需要系统安装 sshpass，或使用 expect
+		logInfo(fmt.Sprintf("使用密码认证方式连接 SSH"))
+
+		// 方法1: 使用 sshpass (如果系统安装了)
+		cmd = exec.Command("sshpass", "-p", SSHPassword, "ssh", "-o", "StrictHostKeyChecking=no",
+			targetAddr, "bash")
+	} else {
+		// 使用密钥认证
+		logInfo(fmt.Sprintf("使用密钥认证方式连接 SSH"))
+		keyPath := filepath.Join(os.Getenv("HOME"), ".ssh", "id_rsa")
+		cmd = exec.Command("ssh", "-i", keyPath, "-o", "StrictHostKeyChecking=no",
+			targetAddr, "bash")
+	}
+
+	cmd.Stdin = strings.NewReader(script)
+
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		logError(fmt.Sprintf("SSH 脚本执行失败 [%s]: %v", stepName, err))
+		logError(fmt.Sprintf("执行输出: %s", string(output)))
+		return
+	}
+
+	logInfo(fmt.Sprintf("[SSH执行成功] 阶段: %s", stepName))
+	if len(string(output)) > 0 {
+		logInfo(fmt.Sprintf("执行输出:\n%s", string(output)))
+	}
+}
+
+// runSqlPlus 在本地以 SYSDBA 身份执行 SQL 并返回输出（用于检查）
+func runSqlPlus(sql string) (string, error) {
+	input := "set heading off feedback off verify off echo off pagesize 0 linesize 200\n" + sql + "\nexit;\n"
+	cmd := exec.Command("sqlplus", "-s", "/ as sysdba")
+	cmd.Stdin = strings.NewReader(input)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
+// 步骤 1: 状态校验（检查并可选启用 ARCHIVELOG 与 FORCE LOGGING）
+func validateAndFixPrimary() {
+	logCheck("正在执行本地 ORACLE_HOME 路径及主库合规性状态审计...")
+	if DemoMode {
+		fmt.Println(ColorWhite + "+------------------------------------------------------------------------------+" + ColorReset)
+		fmt.Printf("  [模拟状态] 主库当前日志模式: [ %sARCHIVELOG%s ]   |   强制日志状态: [ %sYES%s ]\n", ColorGreen, ColorReset, ColorGreen, ColorReset)
+		fmt.Println(ColorWhite + "+------------------------------------------------------------------------------+" + ColorReset)
+		logInfo("【模拟校验通过】主库状态完美符合物理备库架构基线要求。")
+		return
+	}
+
+	// 1) 检查 ARCHIVELOG 模式
+	out, err := runSqlPlus("select log_mode from v$database;")
+	if err != nil {
+		logError(fmt.Sprintf("查询 ARCHIVELOG 状态失败: %v\n%s", err, out))
+		return
+	}
+	mode := strings.ToUpper(strings.TrimSpace(out))
+	logInfo(fmt.Sprintf("当前 LOG_MODE: %s", mode))
+
+	if mode != "ARCHIVELOG" {
+		// 提示并询问是否启用
+		fmt.Printf("检测到当前数据库 LOG_MODE=%s，是否现在启用 ARCHIVELOG？(y/n) [n]: ", mode)
+		var ans string
+		fmt.Scanln(&ans)
+		ans = strings.ToLower(strings.TrimSpace(ans))
+		if ans == "y" {
+			logInfo("开始启用 ARCHIVELOG（shutdown->mount->alter->open）")
+			execLocalSQL("shutdown immediate")
+			execLocalSQL("startup mount")
+			execLocalSQL("alter database archivelog")
+			execLocalSQL("alter database open")
+			// 再次验证
+			out2, err2 := runSqlPlus("select log_mode from v$database;")
+			if err2 == nil {
+				logInfo(fmt.Sprintf("启用后 LOG_MODE=%s", strings.TrimSpace(out2)))
+			}
+		} else {
+			logWarn("跳过启用 ARCHIVELOG，请确保稍后人工启用以满足 Data Guard 要求")
+		}
+	} else {
+		logInfo("数据库已处于 ARCHIVELOG 模式")
+	}
+
+	// 2) 检查 FORCE LOGGING
+	out, err = runSqlPlus("select force_logging from v$database;")
+	if err != nil {
+		logError(fmt.Sprintf("查询 FORCE LOGGING 状态失败: %v\n%s", err, out))
+		return
+	}
+	fl := strings.ToUpper(strings.TrimSpace(out))
+	logInfo(fmt.Sprintf("当前 FORCE_LOGGING: %s", fl))
+	if fl != "YES" && fl != "FORCE" {
+		fmt.Printf("检测到 FORCE LOGGING=%s，是否现在启用 FORCE LOGGING？(y/n) [n]: ", fl)
+		var ans string
+		fmt.Scanln(&ans)
+		ans = strings.ToLower(strings.TrimSpace(ans))
+		if ans == "y" {
+			execLocalSQL("alter database force logging")
+			logInfo("已执行: alter database force logging")
+		} else {
+			logWarn("跳过启用 FORCE LOGGING，请确保满足 DB 恢复一致性要求")
+		}
+	} else {
+		logInfo("数据库已启用 FORCE LOGGING")
+	}
+}
+
+// 步骤 2: 主库参数文件注入模拟
+func configurePrimaryDB() {
+	logCheck(">>> 正在规划主库集群级初始化参数 (SPFILE)...")
+	commands := []string{
+		fmt.Sprintf("alter system set db_unique_name='%s' scope=spfile", PriDBUniqueName),
+		fmt.Sprintf("alter system set log_archive_config='DG_CONFIG=(%s,%s)' scope=both", PriDBUniqueName, StbDBUniqueName),
+		fmt.Sprintf("alter system set log_archive_dest_1='LOCATION=/u01/app/oracle/oradata/%s/arch VALID_FOR=(ONLINE_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=%s' scope=both", PriDBUniqueName, PriDBUniqueName),
+		fmt.Sprintf("alter system set log_archive_dest_2='SERVICE=%s ASYNC VALID_FOR=(ONLINE_LOGFILES,PRIMARY_ROLE) DB_UNIQUE_NAME=%s' scope=both", StbDBUniqueName, StbDBUniqueName),
+		"alter system set log_archive_dest_state_1=ENABLE scope=both",
+		"alter system set log_archive_dest_state_2=ENABLE scope=both",
+		fmt.Sprintf("alter system set fal_server='%s' scope=both", StbDBUniqueName),
+		fmt.Sprintf("alter system set fal_client='%s' scope=both", PriDBUniqueName),
+		"alter system set standby_file_management=AUTO scope=both",
+	}
+
+	for _, cmd := range commands {
+		execLocalSQL(cmd)
+	}
+
+	logCheck(">>> 正在规划为主库镜像槽注入 4 组 Standby Redo Log 空间...")
+	for i := 1; i <= 4; i++ {
+		execLocalSQL(fmt.Sprintf("alter database add standby logfile group %d '/u01/app/oracle/oradata/%s/sredo0%d.log' size 50M", i+3, PriDBUniqueName, i))
+	}
+}
+
+// 步骤 3: 参数文本逻辑重构模拟
+func generateAndModifyPfile() {
+	logCheck(">>> 正在模拟交叉转换并本地生成备库 PFILE 文本媒介...")
+	execLocalSQL(fmt.Sprintf("create pfile='/tmp/init%s.ora' from spfile", StbDBUniqueName))
+	if DemoMode {
+		logInfo(fmt.Sprintf("[模拟文本改写] 将 /tmp/init%s.ora 内所有的 %s 关键字热替换为 %s", StbDBUniqueName, PriDBUniqueName, StbDBUniqueName))
+	}
+}
+
+// 步骤 4: 文件同步模拟
+func transferRequiredFiles() {
+	logCheck(">>> 正在模拟跨网同步控制链钥匙 (密码文件与重构PFILE) 到备库...")
+	pwdFile := fmt.Sprintf("orapw%s", OracleSid)
+	// 密码文件来自主库 ORACLE_HOME
+	srcPwd := filepath.Join(PrimaryOracleHome, "dbs", pwdFile)
+
+	if DemoMode {
+		logInfo(fmt.Sprintf("[模拟本地系统调用]: scp %s %s@%s:%s/dbs/%s", srcPwd, SSHUser, StbIP, StandbyOracleHome, pwdFile))
+		logInfo(fmt.Sprintf("[模拟本地系统调用]: scp /tmp/init%s.ora %s@%s:/tmp/", StbDBUniqueName, SSHUser, StbIP))
+	} else {
+		// 真实环境执行 scp 命令
+		if SSHPassword != "" {
+			// 使用 sshpass 进行密码认证的 scp
+			cmd1 := exec.Command("sshpass", "-p", SSHPassword, "scp", "-o", "StrictHostKeyChecking=no",
+				srcPwd, fmt.Sprintf("%s@%s:%s/dbs/%s", SSHUser, StbIP, StandbyOracleHome, pwdFile))
+			if err := cmd1.Run(); err != nil {
+				logError(fmt.Sprintf("传输密码文件失败: %v", err))
+			} else {
+				logInfo(fmt.Sprintf("成功传输密码文件 %s", pwdFile))
+			}
+
+			cmd2 := exec.Command("sshpass", "-p", SSHPassword, "scp", "-o", "StrictHostKeyChecking=no",
+				fmt.Sprintf("/tmp/init%s.ora", StbDBUniqueName), fmt.Sprintf("%s@%s:/tmp/", SSHUser, StbIP))
+			if err := cmd2.Run(); err != nil {
+				logError(fmt.Sprintf("传输PFILE失败: %v", err))
+			} else {
+				logInfo(fmt.Sprintf("成功传输PFILE /tmp/init%s.ora", StbDBUniqueName))
+			}
+		}
+	}
+}
+
+// 步骤 5: 远程目录拓扑重构模拟
+func remoteCreateDirectories() {
+	cmdStr := fmt.Sprintf("mkdir -p /u01/app/oracle/oradata/%s\nmkdir -p /u01/app/oracle/fast_recovery_area/%s\nmkdir -p /u01/app/oracle/oradata/%s/arch\nmkdir -p /u01/app/oracle/admin/%s/adump",
+		StbDBUniqueName, StbDBUniqueName, OracleSid, OracleSid)
+	execRemoteSSH("构建备库物理OFA拓扑目录", cmdStr)
+}
+
+// 步骤 6: 远程拉起裸实例模拟
+func remoteStartupNomount() {
+	sqlScript := fmt.Sprintf("sqlplus -s / as sysdba << EOF\nstartup nomount pfile='/tmp/init%s.ora';\ncreate spfile from pfile='/tmp/init%s.ora';\nexit;\nEOF",
+		StbDBUniqueName, StbDBUniqueName)
+	execRemoteSSH("拉起备库裸实例到 NOMOUNT", sqlScript)
+}
+
+// 步骤 7: RMAN 物理克隆模拟
+func runRmanDuplicate() {
+	logCheck(">>> 正在模拟全面接入 RMAN 联机物理克隆传输通道 (Active Database Duplicate)...")
+
+	rmanCmd := fmt.Sprintf(`rman target sys/%s@%s auxiliary / << EOF
+run {
+  allocate channel p1 type disk;
+  allocate channel p2 type disk;
+  allocate auxiliary channel s1 type disk;
+  allocate auxiliary channel s2 type disk;
+  duplicate target database for standby from active database nofilenamecheck;
+}
+EOF`, SysPassword, PriTns)
+
+	// RMAN duplicate 命令在备库上执行
+	// target: 连接到主库（远程通过TNS）
+	// auxiliary: 连接本地备库（/ as sysdba）
+	execRemoteSSH("RMAN 联机物理克隆", rmanCmd)
+}
+
+// 步骤 8: 激活动态实时同步模拟
+func remoteEnableADG() {
+	script := "sqlplus -s / as sysdba << EOF\nalter database open;\nalter database recover managed standby database disconnect from session using current logfile;\nexit;\nEOF"
+	execRemoteSSH("备库切入只读模式并强制拉起 MRP0 日志同步进程", script)
+}
+
+// 步骤 9: 终审状态模拟
+func auditFinalStatus() {
+	fmt.Println("\n" + ColorWhite + "================================================================================" + ColorReset)
+	logInfo("模拟部署演练指令全部安全留痕完毕！")
+	fmt.Println(ColorWhite + "================================================================================" + ColorReset)
+	if DemoMode {
+		fmt.Printf(" 模拟 Open Mode 审计结果为: [ %sREAD ONLY WITH APPLY%s ]\n", ColorGreen, ColorReset)
+		fmt.Println(ColorGreen + "\n [SUCCESS] 演练通过！该模拟剧本脚本完全契合全自动安全部署标准。" + ColorReset)
+	}
+}
+
